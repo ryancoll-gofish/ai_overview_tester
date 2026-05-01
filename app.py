@@ -5,15 +5,18 @@ from urllib.parse import urlparse
 st.set_page_config(page_title="GSC AI Overview Estimator", layout="wide")
 
 INTENT_PATTERNS = {
-    "informational": [
-        "what is", "how to", "how do", "why", "when", "where", "who", "can ",
-        "does ", "should ", "guide", "tips", "examples", "template", "meaning",
-    ],
-    "comparative": [
-        "best", "top", "vs", "versus", "compare", "comparison", "alternatives", "software",
-    ],
     "navigational": [
-        "login", "sign in", "homepage", "contact", "address", "phone", "hours", "near me",
+        "login", "sign in", "homepage", "contact", "address", "phone", "hours",
+    ],
+    "commercial": [
+        "best", "top", "vs", "versus", "compare", "comparison",
+        "software", "tool", "tools", "platform", "service", "services",
+        "provider", "solution", "solutions", "company", "companies",
+        "product", "products",
+    ],
+    "informational": [
+        "what is", "how to", "how do", "why", "when", "where", "who",
+        "guide", "tips", "examples", "template", "meaning",
     ],
 }
 
@@ -50,14 +53,12 @@ def normalize_page(value: str) -> str:
 def parse_ctr(value) -> float:
     if pd.isna(value):
         return 0.0
-    value = str(value).strip().replace("%", "")
+    value = str(value).strip().replace("%", "").replace(",", "")
     if value == "":
         return 0.0
     try:
         num = float(value)
-        if num > 1:
-            return num / 100.0
-        return num
+        return num / 100.0 if num > 1 else num
     except ValueError:
         return 0.0
 
@@ -80,11 +81,21 @@ def expected_ctr_for_position(position: float) -> float:
     return 0.008
 
 
-def detect_intent(query: str) -> str:
+def detect_intent(query: str, brand_terms: list[str]) -> str:
     q = str(query or "").strip().lower()
-    for intent, patterns in INTENT_PATTERNS.items():
-        if any(p in q for p in patterns):
-            return intent
+
+    if any(term.lower() in q for term in brand_terms if term.strip()):
+        return "branded"
+
+    if any(p in q for p in INTENT_PATTERNS["navigational"]):
+        return "navigational"
+
+    if any(p in q for p in INTENT_PATTERNS["commercial"]):
+        return "commercial"
+
+    if any(p in q for p in INTENT_PATTERNS["informational"]):
+        return "informational"
+
     return "other"
 
 
@@ -177,8 +188,8 @@ def score_query_row(row: pd.Series, brand_terms: list[str]) -> pd.Series:
     impressions = float(row.get("impressions", 0) or 0)
     ctr = float(row.get("ctr", 0) or 0)
 
-    intent = detect_intent(query)
-    branded = is_branded(query, brand_terms)
+    intent = detect_intent(query, brand_terms)
+    branded = intent == "branded"
     expected_ctr = expected_ctr_for_position(position)
 
     if position > 5:
@@ -197,14 +208,13 @@ def score_query_row(row: pd.Series, brand_terms: list[str]) -> pd.Series:
     if intent == "informational":
         score += 0.15
         reasons.append("Informational query")
-    elif intent == "comparative":
-        score += 0.15
-        reasons.append("Comparative query")
+    elif intent == "commercial":
+        score += 0.20
+        reasons.append("Commercial / comparison query")
     elif intent == "navigational":
         score -= 0.30
         reasons.append("Navigational query")
-
-    if branded:
+    elif intent == "branded":
         score -= 0.25
         reasons.append("Branded query")
 
@@ -217,7 +227,7 @@ def score_query_row(row: pd.Series, brand_terms: list[str]) -> pd.Series:
         confidence += 0.15
     if position > 5 and ctr > expected_ctr:
         confidence += 0.15
-    if intent in {"informational", "comparative"}:
+    if intent in {"informational", "commercial"}:
         confidence += 0.10
     if impressions < 20:
         confidence -= 0.15
@@ -317,20 +327,23 @@ if query_file is None and page_file is None:
 
 query_scored = None
 page_scored = None
+query_all = None
+page_all = None
 
 if query_file is not None:
     try:
         query_raw = pd.read_csv(query_file)
         query_data = prepare_query_export(query_raw)
-        query_scored = pd.concat(
+        query_all = pd.concat(
             [query_data, query_data.apply(score_query_row, axis=1, args=(brand_terms,))],
             axis=1,
         )
-        query_scored["likelihood_bucket"] = query_scored["aio_likelihood"].apply(bucket_label)
-        query_scored = query_scored[
-            (query_scored["impressions"] >= min_impressions)
-            & (query_scored["clicks"] >= min_clicks)
-            & (query_scored["aio_likelihood"] >= min_score)
+        query_all["likelihood_bucket"] = query_all["aio_likelihood"].apply(bucket_label)
+
+        query_scored = query_all[
+            (query_all["impressions"] >= min_impressions)
+            & (query_all["clicks"] >= min_clicks)
+            & (query_all["aio_likelihood"] >= min_score)
         ].sort_values(
             ["aio_likelihood", "confidence", "clicks", "impressions"],
             ascending=False,
@@ -342,15 +355,16 @@ if page_file is not None:
     try:
         page_raw = pd.read_csv(page_file)
         page_data = prepare_page_export(page_raw)
-        page_scored = pd.concat(
+        page_all = pd.concat(
             [page_data, page_data.apply(score_page_row, axis=1, args=(brand_terms,))],
             axis=1,
         )
-        page_scored["likelihood_bucket"] = page_scored["aio_likelihood"].apply(bucket_label)
-        page_scored = page_scored[
-            (page_scored["impressions"] >= min_impressions)
-            & (page_scored["clicks"] >= min_clicks)
-            & (page_scored["aio_likelihood"] >= min_score)
+        page_all["likelihood_bucket"] = page_all["aio_likelihood"].apply(bucket_label)
+
+        page_scored = page_all[
+            (page_all["impressions"] >= min_impressions)
+            & (page_all["clicks"] >= min_clicks)
+            & (page_all["aio_likelihood"] >= min_score)
         ].sort_values(
             ["aio_likelihood", "confidence", "clicks", "impressions"],
             ascending=False,
@@ -358,7 +372,7 @@ if page_file is not None:
     except Exception as exc:
         st.error(f"Could not process pages CSV: {exc}")
 
-if query_scored is None and page_scored is None:
+if query_all is None and page_all is None:
     st.stop()
 
 summary_cols = st.columns(4)
@@ -373,18 +387,18 @@ summary_cols[1].metric("Flagged pages", f"{page_rows:,}")
 summary_cols[2].metric("Avg query score", f"{query_avg:.1%}")
 summary_cols[3].metric("Avg page score", f"{page_avg:.1%}")
 
-tabs = []
 tab_names = []
 if query_scored is not None:
     tab_names.append("Queries")
 if page_scored is not None:
     tab_names.append("Pages")
 
-tab_objects = st.tabs(tab_names)
+tabs = st.tabs(tab_names)
 
 tab_idx = 0
+
 if query_scored is not None:
-    with tab_objects[tab_idx]:
+    with tabs[tab_idx]:
         st.subheader("Top Queries Likely Getting AI Overviews")
         st.dataframe(
             query_scored[
@@ -406,7 +420,7 @@ if query_scored is not None:
 
         st.download_button(
             "Download scored query CSV",
-            data=query_scored.to_csv(index=False).encode("utf-8"),
+            data=query_all.to_csv(index=False).encode("utf-8"),
             file_name="gsc_query_aio_scores.csv",
             mime="text/csv",
             key="download_queries",
@@ -414,7 +428,7 @@ if query_scored is not None:
     tab_idx += 1
 
 if page_scored is not None:
-    with tab_objects[tab_idx]:
+    with tabs[tab_idx]:
         st.subheader("Top Pages Likely Getting AI Overviews")
         st.dataframe(
             page_scored[
@@ -435,7 +449,7 @@ if page_scored is not None:
 
         st.download_button(
             "Download scored pages CSV",
-            data=page_scored.to_csv(index=False).encode("utf-8"),
+            data=page_all.to_csv(index=False).encode("utf-8"),
             file_name="gsc_pages_aio_scores.csv",
             mime="text/csv",
             key="download_pages",
@@ -445,12 +459,18 @@ with st.expander("How this works"):
     st.markdown(
         """
         Query uploads are stronger because they include actual search intent.
-        
-        Page uploads are still useful, but the score is more approximate and based on:
+
+        Query intent is classified as:
+        - informational
+        - commercial
+        - navigational
+        - branded
+
+        Page uploads are more approximate and use:
         - weaker ranking but still getting clicks
         - CTR above expected
         - whether the URL looks informational
-        
+
         This is an estimate, not exact AI Overview attribution.
         """
     )
