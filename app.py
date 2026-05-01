@@ -1,10 +1,7 @@
-import io
-import zipfile
-
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="GSC AI Overview Estimator", layout="wide")
+st.set_page_config(page_title="GSC Query AI Overview Estimator", layout="wide")
 
 INTENT_PATTERNS = {
     "informational": [
@@ -20,15 +17,21 @@ INTENT_PATTERNS = {
 }
 
 
-def normalize_page(value: str) -> str:
-    if pd.isna(value):
-        return ""
-    value = str(value).strip()
-    if value.startswith("http://") or value.startswith("https://"):
-        from urllib.parse import urlparse
-        parsed = urlparse(value)
-        return parsed.path or "/"
-    return value
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    col_map = {}
+    for col in df.columns:
+        clean = str(col).strip().lower()
+        if clean == "top queries":
+            col_map[col] = "query"
+        elif clean == "clicks":
+            col_map[col] = "clicks"
+        elif clean == "impressions":
+            col_map[col] = "impressions"
+        elif clean == "ctr":
+            col_map[col] = "ctr"
+        elif clean == "position":
+            col_map[col] = "position"
+    return df.rename(columns=col_map)
 
 
 def expected_ctr_for_position(position: float) -> float:
@@ -66,17 +69,19 @@ def clamp01(value: float) -> float:
     return max(0.0, min(1.0, value))
 
 
-def prepare_gsc(df: pd.DataFrame) -> pd.DataFrame:
-    required = {"date", "page", "query", "clicks", "impressions", "ctr", "position"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"Missing required columns: {', '.join(sorted(missing))}")
+def prepare_gsc_query_export(df: pd.DataFrame) -> pd.DataFrame:
+    data = normalize_columns(df.copy())
 
-    data = df.copy()
-    data["date"] = pd.to_datetime(data["date"], errors="coerce")
-    data = data.dropna(subset=["date"])
-    data["date"] = data["date"].dt.date.astype(str)
-    data["page"] = data["page"].map(normalize_page)
+    required = {"query", "clicks", "impressions", "ctr", "position"}
+    missing = required - set(data.columns)
+    if missing:
+        raise ValueError(
+            f"Missing required columns: {', '.join(sorted(missing))}. "
+            "Expected headers: Top queries, Clicks, Impressions, CTR, Position"
+        )
+
+    data = data[list(required)].copy()
+    data["query"] = data["query"].astype(str).str.strip()
 
     for col in ["clicks", "impressions", "ctr", "position"]:
         data[col] = pd.to_numeric(data[col], errors="coerce").fillna(0)
@@ -84,6 +89,7 @@ def prepare_gsc(df: pd.DataFrame) -> pd.DataFrame:
     if data["ctr"].max() > 1:
         data["ctr"] = data["ctr"] / 100.0
 
+    data = data[data["query"] != ""].copy()
     return data
 
 
@@ -103,7 +109,7 @@ def score_row(row: pd.Series, brand_terms: list[str]) -> pd.Series:
 
     if position > 5:
         score += 0.20
-        reasons.append("Weak average rank but still receiving clicks")
+        reasons.append("Ranks outside top 5 but still gets clicks")
     if position > 8:
         score += 0.15
     if clicks >= 3:
@@ -163,47 +169,29 @@ def bucket_label(score: float) -> str:
     return "Unlikely"
 
 
-st.title("GSC AI Overview Estimator")
-st.caption("Upload a Google Search Console CSV and estimate which queries are most likely benefiting from AI Overviews.")
+st.title("GSC Query AI Overview Estimator")
+st.caption("Upload a Search Console query export and estimate which queries are most likely benefiting from AI Overviews.")
 
 with st.sidebar:
     st.header("Settings")
     brand_input = st.text_input("Brand terms (comma-separated)", value="")
-    min_impressions = st.slider("Minimum impressions", 0, 1000, 50, 10)
-    min_clicks = st.slider("Minimum clicks", 0, 100, 0, 1)
+    min_impressions = st.slider("Minimum impressions", 0, 10000, 50, 10)
+    min_clicks = st.slider("Minimum clicks", 0, 1000, 0, 1)
     min_score = st.slider("Minimum AIO likelihood", 0.0, 1.0, 0.25, 0.05)
     brand_terms = [x.strip() for x in brand_input.split(",") if x.strip()]
 
-uploaded_file = st.file_uploader("Upload Search Console CSV or ZIP", type=["csv", "zip"])
+uploaded_file = st.file_uploader("Upload Search Console CSV", type=["csv"])
 
-with st.expander("Required columns"):
-    st.code("date, page, query, clicks, impressions, ctr, position")
+with st.expander("Expected CSV headers"):
+    st.code("Top queries, Clicks, Impressions, CTR, Position")
 
 if uploaded_file is None:
-    st.info("Upload a Search Console CSV export to begin.")
+    st.info("Upload your Search Console query CSV to begin.")
     st.stop()
 
 try:
-    if uploaded_file.name.lower().endswith(".zip"):
-        z = zipfile.ZipFile(uploaded_file)
-        csv_files = [name for name in z.namelist() if name.lower().endswith(".csv") and not name.endswith("/")]
-
-        if not csv_files:
-            st.error("No CSV file found inside the ZIP archive.")
-            st.stop()
-
-        if len(csv_files) > 1:
-            selected_csv = st.selectbox("Select CSV file from ZIP", csv_files)
-        else:
-            selected_csv = csv_files[0]
-            st.info(f"Using file from ZIP: {selected_csv}")
-
-        with z.open(selected_csv) as f:
-            raw = pd.read_csv(f)
-    else:
-        raw = pd.read_csv(uploaded_file)
-
-    gsc = prepare_gsc(raw)
+    raw = pd.read_csv(uploaded_file)
+    gsc = prepare_gsc_query_export(raw)
 except Exception as exc:
     st.error(f"Could not read file: {exc}")
     st.stop()
@@ -217,43 +205,9 @@ filtered = scored[
     & (scored["aio_likelihood"] >= min_score)
 ].copy()
 
-query_summary = (
-    filtered.groupby(["query", "page"], as_index=False)
-    .agg({
-        "clicks": "sum",
-        "impressions": "sum",
-        "ctr": "mean",
-        "position": "mean",
-        "aio_likelihood": "mean",
-        "confidence": "mean",
-        "why": "first",
-        "intent": "first",
-        "likelihood_bucket": "first",
-    })
-    .sort_values(["aio_likelihood", "confidence", "clicks"], ascending=False)
-)
-
-page_summary = (
-    filtered.groupby("page", as_index=False)
-    .agg({
-        "clicks": "sum",
-        "impressions": "sum",
-        "aio_likelihood": "mean",
-        "confidence": "mean",
-        "query": "count",
-    })
-    .rename(columns={"query": "flagged_queries"})
-    .sort_values(["aio_likelihood", "clicks"], ascending=False)
-)
-
-trend = (
-    filtered.groupby("date", as_index=False)
-    .agg({
-        "clicks": "sum",
-        "impressions": "sum",
-        "aio_likelihood": "mean",
-    })
-    .sort_values("date")
+filtered = filtered.sort_values(
+    ["aio_likelihood", "confidence", "clicks", "impressions"],
+    ascending=False,
 )
 
 c1, c2, c3, c4 = st.columns(4)
@@ -262,48 +216,40 @@ c2.metric("Queries flagged", f"{len(filtered):,}")
 c3.metric("Avg AIO likelihood", f"{filtered['aio_likelihood'].mean():.1%}" if len(filtered) else "0.0%")
 c4.metric("Avg confidence", f"{filtered['confidence'].mean():.1%}" if len(filtered) else "0.0%")
 
-left, right = st.columns([1.2, 1])
-with left:
-    st.subheader("Estimated AI Overview Trend")
-    if len(trend):
-        st.line_chart(trend.set_index("date")[["aio_likelihood", "clicks", "impressions"]])
-    else:
-        st.write("No rows match your filters.")
-
-with right:
-    st.subheader("Top Pages")
-    st.dataframe(page_summary.head(15), use_container_width=True)
-
 st.subheader("Top Queries Likely Getting AI Overviews")
 st.dataframe(
-    query_summary[[
-        "query", "page", "position", "clicks", "impressions", "ctr",
-        "intent", "aio_likelihood", "confidence", "likelihood_bucket", "why"
+    filtered[[
+        "query",
+        "clicks",
+        "impressions",
+        "ctr",
+        "position",
+        "intent",
+        "aio_likelihood",
+        "confidence",
+        "likelihood_bucket",
+        "why",
     ]],
     use_container_width=True,
 )
 
 st.subheader("Raw Scored Data")
-st.dataframe(scored.sort_values(["aio_likelihood", "confidence"], ascending=False), use_container_width=True)
+st.dataframe(
+    scored.sort_values(["aio_likelihood", "confidence"], ascending=False),
+    use_container_width=True,
+)
 
 st.download_button(
     "Download scored queries CSV",
     data=scored.to_csv(index=False).encode("utf-8"),
-    file_name="gsc_aio_scored_queries.csv",
-    mime="text/csv",
-)
-
-st.download_button(
-    "Download filtered summary CSV",
-    data=query_summary.to_csv(index=False).encode("utf-8"),
-    file_name="gsc_aio_query_summary.csv",
+    file_name="gsc_query_aio_scores.csv",
     mime="text/csv",
 )
 
 with st.expander("How this works"):
     st.markdown(
         """
-        This prototype estimates which queries may be benefiting from AI Overviews using only Search Console data.
+        This prototype estimates which queries may be benefiting from AI Overviews using only Search Console query export data.
 
         It boosts scores when a query:
         - ranks outside the top positions but still gets clicks
