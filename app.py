@@ -1,3 +1,6 @@
+import io
+import zipfile
+
 import pandas as pd
 import streamlit as st
 
@@ -171,7 +174,7 @@ with st.sidebar:
     min_score = st.slider("Minimum AIO likelihood", 0.0, 1.0, 0.25, 0.05)
     brand_terms = [x.strip() for x in brand_input.split(",") if x.strip()]
 
-uploaded_file = st.file_uploader("Upload Search Console CSV", type=["csv"])
+uploaded_file = st.file_uploader("Upload Search Console CSV or ZIP", type=["csv", "zip"])
 
 with st.expander("Required columns"):
     st.code("date, page, query, clicks, impressions, ctr, position")
@@ -181,7 +184,25 @@ if uploaded_file is None:
     st.stop()
 
 try:
-    raw = pd.read_csv(uploaded_file)
+    if uploaded_file.name.lower().endswith(".zip"):
+        z = zipfile.ZipFile(uploaded_file)
+        csv_files = [name for name in z.namelist() if name.lower().endswith(".csv") and not name.endswith("/")]
+
+        if not csv_files:
+            st.error("No CSV file found inside the ZIP archive.")
+            st.stop()
+
+        if len(csv_files) > 1:
+            selected_csv = st.selectbox("Select CSV file from ZIP", csv_files)
+        else:
+            selected_csv = csv_files[0]
+            st.info(f"Using file from ZIP: {selected_csv}")
+
+        with z.open(selected_csv) as f:
+            raw = pd.read_csv(f)
+    else:
+        raw = pd.read_csv(uploaded_file)
+
     gsc = prepare_gsc(raw)
 except Exception as exc:
     st.error(f"Could not read file: {exc}")
